@@ -1,0 +1,10 @@
+{
+  "train_loss": [],
+  "val_loss": [],
+  "val_loss_surrogate": [],
+  "val_loss_load": [],
+  "learning_rate": [],
+  "epochs_completed": 0,
+  "best_val_loss": null,
+  "best_epoch": null
+}
