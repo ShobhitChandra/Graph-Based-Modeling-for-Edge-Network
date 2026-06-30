@@ -1,274 +1,245 @@
 """
-main.py
-=======
-Entry point for the GNN-based Surrogate Discovery pipeline.
+main_v2.py
+==========
+Entry point for the IMPROVED surrogate-discovery pipeline:
+real topologies + HeteroData + ranking losses + temporal model + full metrics.
 
 Run modes
 ─────────
-  python main.py --mode train      → train the GNN from scratch
-  python main.py --mode evaluate   → load best checkpoint, run test set
-  python main.py --mode discover   → demo surrogate discovery on 1 graph
-  python main.py --mode compare    → GNN vs DHT baseline comparison
-  python main.py --mode visualize  → generate all plots
-  python main.py --mode all        → run everything in sequence
+  python main_v2.py --mode train     --model spatial   → train spatial hetero GNN
+  python main_v2.py --mode train     --model temporal  → train temporal GNN
+  python main_v2.py --mode evaluate                     → holdout metrics
+  python main_v2.py --mode robustness                   → perturbation robustness
+  python main_v2.py --mode compare                      → GNN vs DHT (NDCG, P@k)
+  python main_v2.py --mode all       --model temporal
 """
 
 import argparse
 import os
 import json
 import pprint
-import torch
 import numpy as np
+import torch
 import networkx as nx
 
-from src.graph_builder import (
-    generate_edge_network,
-    networkx_to_pyg,
-    generate_surrogate_labels,
-)
-from src.dataset         import build_splits
-from src.gnn_model       import SurrogateDiscoveryGNN
-from src.trainer         import Trainer
-from src.surrogate_discovery import (
-    SurrogateDiscovery,
-    simulate_dht_baseline,
-    compare_gnn_vs_dht,
-)
-from src.visualize import (
-    draw_network,
-    plot_training,
-    plot_score_distribution,
-    plot_embeddings,
-)
+from src.hetero_dataset import build_datasets, build_sequence
+from src.hetero_model import HeteroSurrogateGNN, TemporalSurrogateGNN
+from src.hetero_trainer import HeteroTrainer
+from src.metrics import (evaluate_graph, aggregate_metrics,
+                         robustness_under_perturbation, precision_at_k, ndcg_at_k)
+from src.real_data import (load_topology, assign_roles, build_temporal_snapshots,
+                           list_topologies, NODE_TYPES)
 
-# ──────────────────────────────────────────────────────────────────────
-#  Configuration
-# ──────────────────────────────────────────────────────────────────────
 
 CFG = {
-    # Data
-    "num_graphs":        500,
-    "n_edge_devices":    10,
-    "n_brokers":         4,
-    "n_surrogates":      6,
-    # Model
-    "node_in_dim":       6,
-    "edge_in_dim":       4,
-    "hidden_dim":        64,
-    "num_layers":        3,
-    "heads":             4,
-    "dropout":           0.2,
-    # Training
-    "epochs":            100,
-    "lr":                1e-3,
-    "weight_decay":      1e-4,
-    "batch_size":        16,
-    "lambda1":           1.0,
-    "lambda2":           0.3,
-    "early_stop_patience": 15,
-    # I/O
-    "device":            "cuda" if torch.cuda.is_available() else "cpu",
-    "log_dir":           "outputs/runs",
-    "ckpt_dir":          "outputs/checkpoints",
-    "plot_dir":          "outputs/plots",
+    "topo_dir":      "data/topologies",
+    "T":             6,
+    "max_topologies": 40,
+    "hidden_dim":    64,
+    "num_layers":    3,
+    "heads":         4,
+    "dropout":       0.2,
+    "epochs":        80,
+    "lr":            1e-3,
+    "weight_decay":  1e-4,
+    "w_rank":        1.0,
+    "w_reg":         0.3,
+    "w_load":        0.3,
+    "w_balance":     0.1,
+    "early_stop_patience": 20,
+    "device":        "cuda" if torch.cuda.is_available() else "cpu",
+    "ckpt_dir":      "outputs/checkpoints",
 }
-
-os.makedirs(CFG["plot_dir"], exist_ok=True)
-
-
-# ──────────────────────────────────────────────────────────────────────
-#  Helpers
-# ──────────────────────────────────────────────────────────────────────
-
-def build_model() -> SurrogateDiscoveryGNN:
-    return SurrogateDiscoveryGNN(
-        node_in_dim = CFG["node_in_dim"],
-        edge_in_dim = CFG["edge_in_dim"],
-        hidden_dim  = CFG["hidden_dim"],
-        num_layers  = CFG["num_layers"],
-        heads       = CFG["heads"],
-        dropout     = CFG["dropout"],
-    )
+os.makedirs("outputs", exist_ok=True)
 
 
-def demo_graph():
-    G    = generate_edge_network(seed=999)
-    data = networkx_to_pyg(G)
-    data.y         = generate_surrogate_labels(data)
-    data.true_load = data.x[:, 4].clone()
-    return G, data
+def _build_model(metadata, temporal: bool):
+    Cls = TemporalSurrogateGNN if temporal else HeteroSurrogateGNN
+    return Cls(metadata, in_dim=3, hidden_dim=CFG["hidden_dim"],
+               num_layers=CFG["num_layers"], heads=CFG["heads"],
+               dropout=CFG["dropout"])
+
+
+def _get_metadata():
+    paths = list_topologies(CFG["topo_dir"])
+    G = assign_roles(load_topology(paths[0]), seed=0)
+    snaps = build_temporal_snapshots(G, T=CFG["T"], seed=0)
+    from src.hetero_graph import nx_to_hetero
+    return nx_to_hetero(snaps[-1]).metadata()
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  Modes
-# ──────────────────────────────────────────────────────────────────────
 
-def mode_train():
-    print("\n[MODE] TRAIN")
-    train_ds, val_ds, test_ds = build_splits(num_graphs=CFG["num_graphs"])
+def mode_train(temporal: bool):
+    print(f"\n[TRAIN] model={'temporal' if temporal else 'spatial'}")
+    train, val, holdout = build_datasets(
+        CFG["topo_dir"], T=CFG["T"], max_topologies=CFG["max_topologies"])
+    metadata = train[0][0][-1].metadata()
+    model = _build_model(metadata, temporal)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  Model params: {n_params:,}")
 
-    model   = build_model()
-    trainer = Trainer(model, train_ds, val_ds, test_ds, CFG)
+    cfg = dict(CFG); cfg["temporal"] = temporal
+    trainer = HeteroTrainer(model, train, val, holdout, cfg)
     history = trainer.train()
-
-    # Save history for later plotting
-    os.makedirs("outputs", exist_ok=True)
-    with open("outputs/history.json", "w") as f:
+    with open("outputs/history_v2.json", "w") as f:
         json.dump(history, f, indent=2)
 
-    # Quick test evaluation
     trainer.load_best()
-    test_metrics = trainer.evaluate(trainer.test_loader)
-    print("\n  Test metrics:")
-    pprint.pprint(test_metrics)
-    return history
+    hold_metrics = trainer.evaluate(holdout)
+    print("\n  ── HOLDOUT (unseen topologies) ──")
+    pprint.pprint({k: round(v, 4) for k, v in hold_metrics.items()})
+    with open("outputs/holdout_metrics.json", "w") as f:
+        json.dump(hold_metrics, f, indent=2)
+    return trainer, holdout
 
 
-def mode_evaluate():
-    print("\n[MODE] EVALUATE")
-    _, _, test_ds = build_splits(num_graphs=CFG["num_graphs"])
+def mode_evaluate(temporal: bool):
+    print("\n[EVALUATE]")
+    train, val, holdout = build_datasets(
+        CFG["topo_dir"], T=CFG["T"], max_topologies=CFG["max_topologies"])
+    metadata = train[0][0][-1].metadata()
+    model = _build_model(metadata, temporal)
+    cfg = dict(CFG); cfg["temporal"] = temporal
+    trainer = HeteroTrainer(model, train, val, holdout, cfg)
+    try:
+        trainer.load_best()
+    except FileNotFoundError:
+        print("  No checkpoint — train first.")
+        return
+    metrics = trainer.evaluate(holdout)
+    print("\n  Holdout metrics:")
+    pprint.pprint({k: round(v, 4) for k, v in metrics.items()})
 
-    model   = build_model()
-    trainer = Trainer(model, test_ds, test_ds, test_ds, CFG)
-    trainer.load_best()
-    metrics = trainer.evaluate(trainer.test_loader)
-    print("\n  Test metrics:")
-    pprint.pprint(metrics)
-    return metrics
 
+def mode_robustness(temporal: bool):
+    print("\n[ROBUSTNESS] top-k stability under feature noise")
+    train, val, holdout = build_datasets(
+        CFG["topo_dir"], T=CFG["T"], max_topologies=CFG["max_topologies"])
+    metadata = train[0][0][-1].metadata()
+    model = _build_model(metadata, temporal)
+    cfg = dict(CFG); cfg["temporal"] = temporal
+    trainer = HeteroTrainer(model, train, val, holdout, cfg)
+    try:
+        trainer.load_best()
+    except FileNotFoundError:
+        print("  No checkpoint — train first.")
+        return
+    model.eval()
+    device = torch.device(CFG["device"])
 
-def mode_discover():
-    print("\n[MODE] DISCOVER  (single-graph demo)")
-    G, data = demo_graph()
+    def model_fn(seq):
+        seq = [g.to(device) for g in seq]
+        with torch.no_grad():
+            if temporal:
+                sl, _, _ = model(seq)
+            else:
+                sl, _, _ = model(seq[-1])
+        return torch.sigmoid(sl), seq[-1]["surrogate"].y
 
-    model = build_model()
-    ckpt  = os.path.join(CFG["ckpt_dir"], "best_model.pt")
-    if os.path.exists(ckpt):
-        state = torch.load(ckpt, map_location=CFG["device"])
-        model.load_state_dict(state["model_state"])
-        print(f"  Loaded checkpoint (ep {state['epoch']})")
-    else:
-        print("  No checkpoint found – using random weights (demo mode)")
-
-    disc    = SurrogateDiscovery(model, device=torch.device(CFG["device"]))
-    results = disc.discover(data, top_k=3)
-
-    print("\n  ── GNN Surrogate Rankings ──────────────────────────────")
-    for dev, surrogates in list(results.items())[:3]:
-        print(f"\n  Edge Device {dev}:")
-        for rank, s in enumerate(surrogates, 1):
-            print(f"    #{rank}  Surrogate {s['surrogate']:>3d}  "
-                  f"score={s['score']:.4f}  "
-                  f"cap={s['features']['capacity']}  "
-                  f"load={s['features']['load']}  "
-                  f"lat={s['features']['latency_ms']}ms")
+    results = []
+    for seq, name in holdout[:5]:
+        r = robustness_under_perturbation(model_fn, seq, noise_std=0.05, trials=5)
+        r["topology"] = name
+        results.append(r)
+        print(f"  {name:20s} base P@3={r['base_precision@3']:.3f} "
+              f"noisy P@3={r['noisy_precision@3']:.3f}±{r['noisy_precision@3_std']:.3f} "
+              f"stability τ={r['ranking_stability_tau']:.3f}")
     return results
 
 
-def mode_compare():
-    print("\n[MODE] COMPARE  GNN vs DHT baseline")
-    G, data = demo_graph()
-
-    model = build_model()
-    ckpt  = os.path.join(CFG["ckpt_dir"], "best_model.pt")
-    if os.path.exists(ckpt):
-        state = torch.load(ckpt, map_location=CFG["device"])
-        model.load_state_dict(state["model_state"])
-
-    disc     = SurrogateDiscovery(model, device=torch.device(CFG["device"]))
-    gnn_res  = disc.discover(data, top_k=3)
-    dht_res  = simulate_dht_baseline(G, top_k=3)
-    comp     = compare_gnn_vs_dht(gnn_res, dht_res, data.y)
-
-    print(f"\n  Precision@{comp['top_k']}:")
-    print(f"    GNN  : {comp['gnn_precision_at_k']:.4f}")
-    print(f"    DHT  : {comp['dht_precision_at_k']:.4f}")
-    print(f"    Δ    : {comp['gnn_precision_at_k'] - comp['dht_precision_at_k']:+.4f}")
-    return comp
+# ── DHT baseline on hetero graph (hop-count) ─────────────────────────
+def _dht_scores(G: nx.Graph):
+    """Return per-surrogate negative mean hop-distance from all devices."""
+    devices = [n for n, d in G.nodes(data=True) if d["node_type"] == NODE_TYPES["edge_device"]]
+    surrogates = [n for n, d in G.nodes(data=True) if d["node_type"] == NODE_TYPES["surrogate"]]
+    scores, labels = [], []
+    for s in surrogates:
+        hops = []
+        for dev in devices:
+            try:
+                hops.append(nx.shortest_path_length(G, dev, s))
+            except nx.NetworkXNoPath:
+                hops.append(99)
+        scores.append(-np.mean(hops))          # closer = higher score
+        labels.append(G.nodes[s]["y"])
+    return np.array(scores), np.array(labels)
 
 
-def mode_visualize():
-    print("\n[MODE] VISUALIZE")
-    G, data = demo_graph()
-
-    # 1. Network graph
-    draw_network(G, save_path=os.path.join(CFG["plot_dir"], "network_graph.png"))
-    print("  Saved: network_graph.png")
-
-    # 2. Training curves (need saved history)
-    hist_path = "outputs/history.json"
-    if os.path.exists(hist_path):
-        with open(hist_path) as f:
-            history = json.load(f)
-        plot_training(history, save_path=os.path.join(CFG["plot_dir"], "training_curves.png"))
-        print("  Saved: training_curves.png")
-    else:
-        print("  Skipping training curves (run --mode train first)")
-
-    # 3. Score distribution
-    model = build_model()
-    ckpt  = os.path.join(CFG["ckpt_dir"], "best_model.pt")
-    if os.path.exists(ckpt):
-        state = torch.load(ckpt, map_location=CFG["device"])
-        model.load_state_dict(state["model_state"])
-
+def mode_compare(temporal: bool):
+    print("\n[COMPARE] GNN vs DHT hop-count baseline (holdout topologies)")
+    train, val, holdout = build_datasets(
+        CFG["topo_dir"], T=CFG["T"], max_topologies=CFG["max_topologies"])
+    metadata = train[0][0][-1].metadata()
+    model = _build_model(metadata, temporal)
+    cfg = dict(CFG); cfg["temporal"] = temporal
+    trainer = HeteroTrainer(model, train, val, holdout, cfg)
+    try:
+        trainer.load_best()
+    except FileNotFoundError:
+        print("  No checkpoint — train first.")
+        return
     model.eval()
     device = torch.device(CFG["device"])
-    data   = data.to(device)
-    model  = model.to(device)
 
-    with torch.no_grad():
-        scores, _, emb = model(data)
+    gnn_m, dht_m = [], []
+    paths = list_topologies(CFG["topo_dir"])
+    # rebuild the same holdout graphs as nx for DHT
+    for seq, name in holdout:
+        target = seq[-1].to(device)
+        with torch.no_grad():
+            if temporal:
+                sl, _, _ = model([g.to(device) for g in seq])
+            else:
+                sl, _, _ = model(target)
+        gnn_scores = torch.sigmoid(sl).cpu().numpy()
+        gnn_labels = target["surrogate"].y.cpu().numpy()
+        gnn_m.append({
+            "precision@1": precision_at_k(gnn_scores, gnn_labels, 1),
+            "precision@3": precision_at_k(gnn_scores, gnn_labels, 3),
+            "ndcg@3":      ndcg_at_k(gnn_scores, gnn_labels, 3),
+        })
+        # DHT on the matching topology
+        match = [p for p in paths if p.endswith(name + ".graphml")]
+        if match:
+            G = assign_roles(load_topology(match[0]), seed=0)
+            snaps = build_temporal_snapshots(G, T=CFG["T"], seed=0)
+            ds, dl = _dht_scores(snaps[-1])
+            dht_m.append({
+                "precision@1": precision_at_k(ds, dl, 1),
+                "precision@3": precision_at_k(ds, dl, 3),
+                "ndcg@3":      ndcg_at_k(ds, dl, 3),
+            })
 
-    sur_mask = (data.node_type == 2)
-    pred = scores[sur_mask].cpu().numpy()
-    true = data.y[sur_mask].cpu().numpy()
-
-    plot_score_distribution(pred, true,
-        save_path=os.path.join(CFG["plot_dir"], "score_dist.png"))
-    print("  Saved: score_dist.png")
-
-    # 4. t-SNE embeddings
-    plot_embeddings(emb.cpu(), data.node_type.cpu(),
-        save_path=os.path.join(CFG["plot_dir"], "tsne_embeddings.png"))
-    print("  Saved: tsne_embeddings.png")
+    gnn_avg = aggregate_metrics(gnn_m)
+    dht_avg = aggregate_metrics(dht_m)
+    print("\n  Metric        GNN      DHT      Δ")
+    for k in ["precision@1", "precision@3", "ndcg@3"]:
+        g, d = gnn_avg.get(k, 0), dht_avg.get(k, 0)
+        print(f"  {k:12s} {g:.4f}   {d:.4f}   {g-d:+.4f}")
+    return gnn_avg, dht_avg
 
 
-# ──────────────────────────────────────────────────────────────────────
-#  CLI
 # ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="GNN-based Surrogate Discovery in Edge Networks"
-    )
-    parser.add_argument(
-        "--mode",
-        choices=["train", "evaluate", "discover", "compare", "visualize", "all"],
-        default="all",
-        help="Which pipeline step to run",
-    )
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=["train", "evaluate", "robustness",
+                                       "compare", "all"], default="all")
+    ap.add_argument("--model", choices=["spatial", "temporal"], default="temporal")
+    args = ap.parse_args()
+    temporal = (args.model == "temporal")
 
-    print("\n" + "═" * 60)
-    print("   Graph-Based Surrogate Discovery in Edge Networks")
-    print("   RouteNet-Inspired GNN  •  PyTorch Geometric")
-    print("═" * 60)
-    print(f"   Device : {CFG['device']}")
+    print("═" * 64)
+    print("  Improved Surrogate Discovery — Real Topologies + HeteroGNN")
+    print("═" * 64)
 
     if args.mode in ("train", "all"):
-        history = mode_train()
-
-    if args.mode in ("evaluate", "all"):
-        mode_evaluate()
-
-    if args.mode in ("discover", "all"):
-        mode_discover()
-
+        mode_train(temporal)
+    if args.mode in ("evaluate",):
+        mode_evaluate(temporal)
     if args.mode in ("compare", "all"):
-        mode_compare()
-
-    if args.mode in ("visualize", "all"):
-        mode_visualize()
-
-    print("\n  Done. Outputs saved to outputs/")
+        mode_compare(temporal)
+    if args.mode in ("robustness", "all"):
+        mode_robustness(temporal)
+    print("\n  Done.")
